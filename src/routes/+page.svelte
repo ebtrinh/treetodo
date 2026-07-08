@@ -3,20 +3,24 @@
   import { supabase, TREE_ID } from '$lib/supabase.js';
 
   // ---- Model -------------------------------------------------------------
-  // A node is a todo: { id, text, done, x, y, parent, w?, h? }
-  // The tree is defined by each node's `parent` (null = root). One parent,
-  // many children. Children are prerequisites: a node can only be completed
-  // once all of its children (the tasks that "lead to" it) are done.
+  // Items live in one array. Two kinds:
+  //   task: { id, kind:'task', text, done, x, y, parent, w?, h? }
+  //   note: { id, kind:'note', text, x, y, w?, h? }   (free-floating text box)
+  // The task tree is defined by each task's `parent` (null = root). Children
+  // are prerequisites: a task can only be completed once all its children are.
   // `w`/`h` are optional manual sizes set by dragging the resize grip.
 
   let nodes = $state([]);
   let nextId = $state(1);
   let selectedId = $state(null);
 
-  // Measured on-screen size of each node card (id -> {w,h}); used to anchor edges.
+  // Pan/zoom of the canvas "world".
+  let view = $state({ x: 0, y: 0, scale: 1 });
+
+  // Measured on-screen size of each card (id -> {w,h}); used to anchor edges.
   let dims = $state({});
 
-  // Connection drag state: when the user grabs a node's handle we track the
+  // Connection drag state: when the user grabs a task's handle we track the
   // pointer so we can draw a live "rubber band" and drop onto a target.
   let linking = $state(null); // { fromId, x, y }
   let hoverTargetId = $state(null);
@@ -24,6 +28,9 @@
   const STORAGE_KEY = 'tree-todo-v1';
   const DEFAULT_W = 200;
   const DEFAULT_H = 84;
+
+  const isNote = (n) => n.kind === 'note';
+  const isTask = (n) => n.kind !== 'note';
 
   // ---- Persistence + Supabase sync --------------------------------------
   let loaded = false;
@@ -38,12 +45,17 @@
         const data = JSON.parse(saved);
         nodes = data.nodes ?? [];
         nextId = data.nextId ?? nodes.length + 1;
+        if (data.view) view = data.view;
       }
     } catch (e) {
       console.warn('Could not load saved tree', e);
     }
     init();
-    return () => clearTimeout(saveTimer);
+    canvasEl?.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      clearTimeout(saveTimer);
+      canvasEl?.removeEventListener('wheel', onWheel);
+    };
   });
 
   async function init() {
@@ -73,8 +85,8 @@
             if (!d?.nodes) return;
             const incoming = JSON.stringify({ nodes: d.nodes, nextId: d.nextId ?? nextId });
             if (incoming === lastSynced) return; // our own echo
-            // Don't yank the tree out from under an in-progress drag/resize.
-            if (dragging || resizing || linking) return;
+            // Don't yank the tree out from under an in-progress interaction.
+            if (dragging || resizing || linking || panning) return;
             lastSynced = incoming;
             nodes = d.nodes;
             nextId = d.nextId ?? nextId;
@@ -88,10 +100,11 @@
   }
 
   $effect(() => {
-    // Re-runs whenever nodes/nextId change.
+    // Re-runs whenever nodes/nextId/view change.
+    const snapshot = { nodes, nextId, view };
     const payload = JSON.stringify({ nodes, nextId });
     try {
-      localStorage.setItem(STORAGE_KEY, payload);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch (e) {
       /* ignore quota errors */
     }
@@ -112,36 +125,39 @@
 
   function seed() {
     nodes = [
-      { id: 1, text: 'Plan the project', done: false, x: 420, y: 80, parent: null },
-      { id: 2, text: 'Design the UI', done: false, x: 220, y: 300, parent: 1 },
-      { id: 3, text: 'Build the backend', done: false, x: 620, y: 300, parent: 1 },
-      { id: 4, text: 'Pick colors', done: true, x: 120, y: 520, parent: 2 }
+      { id: 1, kind: 'task', text: 'Plan the project', done: false, x: 420, y: 80, parent: null },
+      { id: 2, kind: 'task', text: 'Design the UI', done: false, x: 220, y: 300, parent: 1 },
+      { id: 3, kind: 'task', text: 'Build the backend', done: false, x: 620, y: 300, parent: 1 },
+      { id: 4, kind: 'task', text: 'Pick colors', done: true, x: 120, y: 520, parent: 2 }
     ];
     nextId = 5;
   }
 
   // ---- Node ops ----------------------------------------------------------
   function addNode(parent = null) {
-    // Drop new nodes near the parent, or in the middle of the viewport.
-    let x = 320 + Math.round((idHash(nextId) % 200) - 100);
-    let y = 140;
+    let x, y;
     if (parent != null) {
       const p = nodes.find((n) => n.id === parent);
-      if (p) {
-        const siblings = nodes.filter((n) => n.parent === parent).length;
-        x = p.x + siblings * 200 - 60;
-        y = p.y + 180;
-      }
+      const siblings = nodes.filter((n) => n.parent === parent).length;
+      x = p.x + siblings * 200 - 60;
+      y = p.y + 180;
+    } else {
+      const c = viewCenterWorld();
+      x = c.x - DEFAULT_W / 2;
+      y = c.y - DEFAULT_H / 2;
     }
-    const node = { id: nextId, text: 'New todo', done: false, x, y, parent };
+    const node = { id: nextId, kind: 'task', text: 'New todo', done: false, x, y, parent };
     nodes = [...nodes, node];
     selectedId = nextId;
     nextId += 1;
   }
 
-  // Deterministic pseudo-random spread so it survives SSR/hydration.
-  function idHash(n) {
-    return (n * 2654435761) >>> 8;
+  function addNote() {
+    const c = viewCenterWorld();
+    const node = { id: nextId, kind: 'note', text: 'Text', x: c.x - 90, y: c.y - 24 };
+    nodes = [...nodes, node];
+    selectedId = nextId;
+    nextId += 1;
   }
 
   function deleteNode(id) {
@@ -154,11 +170,10 @@
     if (selectedId === id) selectedId = null;
   }
 
-  // Children are the prerequisites of a node.
+  // Children are the prerequisites of a task.
   function prereqs(id) {
     return nodes.filter((n) => n.parent === id);
   }
-  // Can this node be marked done? Only once every prerequisite is done.
   function canComplete(id) {
     return prereqs(id).every((d) => d.done);
   }
@@ -172,8 +187,7 @@
     const node = nodeById.get(id);
     if (!node) return;
     if (!node.done) {
-      // Locked until every prerequisite (child) is complete.
-      if (!canComplete(id)) return;
+      if (!canComplete(id)) return; // locked until every prerequisite is done
       nodes = nodes.map((n) => (n.id === id ? { ...n, done: true } : n));
     } else {
       // Un-completing breaks the chain, so no ancestor may stay "done".
@@ -191,7 +205,6 @@
     nodes = nodes.map((n) => (n.id === id ? { ...n, text } : n));
   }
 
-  // Would making `parentId` the parent of `childId` create a cycle?
   function wouldCycle(childId, parentId) {
     let cur = parentId;
     while (cur != null) {
@@ -203,6 +216,7 @@
 
   function connect(childId, parentId) {
     if (childId === parentId) return;
+    if (nodeById.get(parentId)?.kind === 'note') return; // notes can't be parents
     if (wouldCycle(parentId, childId)) return; // dropping a parent onto its own descendant
     nodes = nodes.map((n) => (n.id === childId ? { ...n, parent: parentId } : n));
   }
@@ -218,48 +232,71 @@
     }
   }
 
-  // ---- Dragging nodes ----------------------------------------------------
+  // ---- Pointer / drag / resize / pan ------------------------------------
   let dragging = null; // { id, dx, dy }
   let resizing = null; // { id, sx, sy, w, h }
+  let panning = null; // { sx, sy, ox, oy }
   let canvasEl;
 
-  function pointerInCanvas(e) {
+  // Convert a screen event to world (pre-transform) coordinates.
+  function pointerInWorld(e) {
     const r = canvasEl.getBoundingClientRect();
-    return { x: e.clientX - r.left + canvasEl.scrollLeft, y: e.clientY - r.top + canvasEl.scrollTop };
+    return {
+      x: (e.clientX - r.left - view.x) / view.scale,
+      y: (e.clientY - r.top - view.y) / view.scale
+    };
+  }
+
+  function viewCenterWorld() {
+    const r = canvasEl.getBoundingClientRect();
+    return { x: (r.width / 2 - view.x) / view.scale, y: (r.height / 2 - view.y) / view.scale };
   }
 
   function startDrag(e, node) {
     if (e.button !== 0) return;
     selectedId = node.id;
-    const p = pointerInCanvas(e);
+    const p = pointerInWorld(e);
     dragging = { id: node.id, dx: p.x - node.x, dy: p.y - node.y };
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
+    addPointerListeners();
   }
 
   function startLink(e, node) {
     e.stopPropagation();
-    const p = pointerInCanvas(e);
+    const p = pointerInWorld(e);
     linking = { fromId: node.id, x: p.x, y: p.y };
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
+    addPointerListeners();
   }
 
   function startResize(e, node) {
     e.stopPropagation();
     if (e.button !== 0) return;
-    const p = pointerInCanvas(e);
+    const p = pointerInWorld(e);
     const d = dims[node.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
     resizing = { id: node.id, sx: p.x, sy: p.y, w: node.w ?? d.w, h: node.h ?? d.h };
+    addPointerListeners();
+  }
+
+  function startPan(e) {
+    if (e.button !== 0) return;
+    selectedId = null;
+    panning = { sx: e.clientX, sy: e.clientY, ox: view.x, oy: view.y };
+    addPointerListeners();
+  }
+
+  function addPointerListeners() {
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
   }
 
   function onPointerMove(e) {
-    const p = pointerInCanvas(e);
+    if (panning) {
+      view = { ...view, x: panning.ox + (e.clientX - panning.sx), y: panning.oy + (e.clientY - panning.sy) };
+      return;
+    }
+    const p = pointerInWorld(e);
     if (resizing) {
-      const w = Math.max(150, Math.round(resizing.w + (p.x - resizing.sx)));
-      const h = Math.max(64, Math.round(resizing.h + (p.y - resizing.sy)));
+      const w = Math.max(120, Math.round(resizing.w + (p.x - resizing.sx)));
+      const h = Math.max(48, Math.round(resizing.h + (p.y - resizing.sy)));
       nodes = nodes.map((n) => (n.id === resizing.id ? { ...n, w, h } : n));
     } else if (dragging) {
       nodes = nodes.map((n) =>
@@ -270,21 +307,49 @@
       const el = document.elementFromPoint(e.clientX, e.clientY);
       const card = el?.closest('[data-node-id]');
       const tid = card ? Number(card.getAttribute('data-node-id')) : null;
-      hoverTargetId = tid && tid !== linking.fromId ? tid : null;
+      const target = tid != null ? nodeById.get(tid) : null;
+      hoverTargetId = target && isTask(target) && tid !== linking.fromId ? tid : null;
     }
   }
 
   function onPointerUp() {
     if (linking && hoverTargetId != null) {
-      // Drop the dragged node ONTO a target => target becomes the parent.
       connect(linking.fromId, hoverTargetId);
     }
     dragging = null;
     resizing = null;
     linking = null;
+    panning = null;
     hoverTargetId = null;
     window.removeEventListener('pointermove', onPointerMove);
     window.removeEventListener('pointerup', onPointerUp);
+  }
+
+  // ---- Zoom --------------------------------------------------------------
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+  function zoomAt(factor, clientX, clientY) {
+    const r = canvasEl.getBoundingClientRect();
+    const mx = clientX - r.left;
+    const my = clientY - r.top;
+    const s = clamp(view.scale * factor, 0.25, 3);
+    const wx = (mx - view.x) / view.scale;
+    const wy = (my - view.y) / view.scale;
+    view = { scale: s, x: mx - wx * s, y: my - wy * s };
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+  }
+
+  function zoomButton(factor) {
+    const r = canvasEl.getBoundingClientRect();
+    zoomAt(factor, r.left + r.width / 2, r.top + r.height / 2);
+  }
+
+  function resetView() {
+    view = { x: 0, y: 0, scale: 1 };
   }
 
   // ---- Actions -----------------------------------------------------------
@@ -323,13 +388,13 @@
 
   const edges = $derived(
     nodes
-      .filter((n) => n.parent != null && nodeById.has(n.parent))
+      .filter((n) => isTask(n) && n.parent != null && nodeById.has(n.parent))
       .map((n) => ({ from: nodeById.get(n.parent), to: n }))
   );
 
   const stats = $derived({
-    total: nodes.length,
-    done: nodes.filter((n) => n.done).length
+    total: nodes.filter(isTask).length,
+    done: nodes.filter((n) => isTask(n) && n.done).length
   });
 
   // A subtree counts as "complete" for the ring if the node + all descendants done.
@@ -345,8 +410,7 @@
     return { total, done };
   }
 
-  // Anchor points for an edge: bottom-center of parent -> top-center of child,
-  // using the measured card sizes.
+  // Anchor points for an edge: bottom-center of parent -> top-center of child.
   function edgePath(from, to) {
     const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
     const td = dims[to.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
@@ -366,115 +430,146 @@
     <h1>🌳 Tree&nbsp;Todo</h1>
     <div class="toolbar">
       <button class="primary" onclick={() => addNode(null)}>+ Add node</button>
+      <button onclick={addNote}>+ Text box</button>
       {#if selectedId != null}
         <button onclick={() => addNode(selectedId)}>+ Child of selected</button>
         <button onclick={() => detach(selectedId)}>Detach selected</button>
       {/if}
       <span class="spacer"></span>
+      <div class="zoom">
+        <button onclick={() => zoomButton(1 / 1.2)} title="Zoom out">−</button>
+        <span class="zval">{Math.round(view.scale * 100)}%</span>
+        <button onclick={() => zoomButton(1.2)} title="Zoom in">+</button>
+        <button onclick={resetView} title="Reset view">⤢</button>
+      </div>
       <span class="count">{stats.done}/{stats.total} done</span>
       <button class="ghost" onclick={clearAll}>Clear</button>
     </div>
     <p class="hint">
-      Drag a card to move it, or its <b>bottom-right grip</b> to resize. Drag from a card's
-      <b>◦ handle</b> onto another card to make that card its <b>parent</b>. A card's children are
-      its prerequisites — finish them before you can check it off.
+      Drag empty space to <b>pan</b>, scroll to <b>zoom</b>. Drag a card to move it, or its
+      <b>bottom-right grip</b> to resize. Drag a card's <b>◦ handle</b> onto another to make that
+      card its <b>parent</b> — children are prerequisites you must finish first.
     </p>
   </header>
 
   <div
     class="canvas"
     bind:this={canvasEl}
-    onpointerdown={() => (selectedId = null)}
+    onpointerdown={startPan}
+    style="background-position: {view.x}px {view.y}px; background-size: {26 * view.scale}px {26 * view.scale}px"
   >
-    <!-- Edges -->
-    <svg class="edges">
-      {#each edges as e (e.to.id)}
-        <path
-          d={edgePath(e.from, e.to)}
-          class:done={e.to.done}
-          fill="none"
-        />
-      {/each}
-      {#if linking}
-        {@const from = nodeById.get(linking.fromId)}
-        {#if from}
-          {@const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H }}
-          <path
-            class="linking"
-            d={`M ${from.x + fd.w / 2} ${from.y + fd.h / 2} L ${linking.x} ${linking.y}`}
-            fill="none"
-          />
+    <div
+      class="world"
+      style="transform: translate({view.x}px, {view.y}px) scale({view.scale})"
+    >
+      <!-- Edges -->
+      <svg class="edges">
+        {#each edges as e (e.to.id)}
+          <path d={edgePath(e.from, e.to)} class:done={e.to.done} fill="none" />
+        {/each}
+        {#if linking}
+          {@const from = nodeById.get(linking.fromId)}
+          {#if from}
+            {@const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H }}
+            <path
+              class="linking"
+              d={`M ${from.x + fd.w / 2} ${from.y + fd.h / 2} L ${linking.x} ${linking.y}`}
+              fill="none"
+            />
+          {/if}
         {/if}
-      {/if}
-    </svg>
+      </svg>
 
-    <!-- Nodes -->
-    {#each nodes as node (node.id)}
-      {@const prog = subtreeProgress(node.id)}
-      {@const complete = prog.done === prog.total}
-      {@const blocked = isBlocked(node.id)}
-      <div
-        class="node"
-        class:done={node.done}
-        class:dim={node.done || blocked}
-        class:selected={selectedId === node.id}
-        class:target={hoverTargetId === node.id}
-        data-node-id={node.id}
-        use:measure={node.id}
-        style="left:{node.x}px; top:{node.y}px; width:{node.w ?? DEFAULT_W}px; min-height:{node.h ?? DEFAULT_H}px"
-        onpointerdown={(e) => {
-          e.stopPropagation();
-          startDrag(e, node);
-        }}
-      >
-        <div class="row">
-          <button
-            class="check"
-            class:on={node.done}
-            class:locked={blocked}
-            disabled={blocked}
-            title={blocked ? 'Complete its prerequisite tasks first' : 'Toggle done'}
-            onpointerdown={(e) => e.stopPropagation()}
-            onclick={() => toggleDone(node.id)}
-          >{node.done ? '✓' : blocked ? '🔒' : ''}</button>
+      <!-- Nodes -->
+      {#each nodes as node (node.id)}
+        {#if isNote(node)}
+          <div
+            class="note"
+            class:selected={selectedId === node.id}
+            data-node-id={node.id}
+            use:measure={node.id}
+            style="left:{node.x}px; top:{node.y}px; width:{node.w ?? 180}px; min-height:{node.h ?? 44}px"
+            onpointerdown={(e) => {
+              e.stopPropagation();
+              startDrag(e, node);
+            }}
+          >
+            <textarea
+              class="text"
+              rows="1"
+              value={node.text}
+              use:autogrow={[node.text, node.w]}
+              onpointerdown={(e) => e.stopPropagation()}
+              oninput={(e) => setText(node.id, e.currentTarget.value)}
+            ></textarea>
+            <button
+              class="del note-del"
+              title="Delete"
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={() => deleteNode(node.id)}
+            >×</button>
+            <div class="grip" title="Drag to resize" onpointerdown={(e) => startResize(e, node)}></div>
+          </div>
+        {:else}
+          {@const prog = subtreeProgress(node.id)}
+          {@const complete = prog.done === prog.total}
+          {@const blocked = isBlocked(node.id)}
+          <div
+            class="node"
+            class:done={node.done}
+            class:dim={node.done || blocked}
+            class:selected={selectedId === node.id}
+            class:target={hoverTargetId === node.id}
+            data-node-id={node.id}
+            use:measure={node.id}
+            style="left:{node.x}px; top:{node.y}px; width:{node.w ?? DEFAULT_W}px; min-height:{node.h ?? DEFAULT_H}px"
+            onpointerdown={(e) => {
+              e.stopPropagation();
+              startDrag(e, node);
+            }}
+          >
+            <div class="row">
+              <button
+                class="check"
+                class:on={node.done}
+                class:locked={blocked}
+                disabled={blocked}
+                title={blocked ? 'Complete its prerequisite tasks first' : 'Toggle done'}
+                onpointerdown={(e) => e.stopPropagation()}
+                onclick={() => toggleDone(node.id)}
+              >{node.done ? '✓' : blocked ? '🔒' : ''}</button>
 
-          <textarea
-            class="text"
-            rows="1"
-            value={node.text}
-            use:autogrow={[node.text, node.w]}
-            onpointerdown={(e) => e.stopPropagation()}
-            oninput={(e) => setText(node.id, e.currentTarget.value)}
-          ></textarea>
+              <textarea
+                class="text"
+                rows="1"
+                value={node.text}
+                use:autogrow={[node.text, node.w]}
+                onpointerdown={(e) => e.stopPropagation()}
+                oninput={(e) => setText(node.id, e.currentTarget.value)}
+              ></textarea>
 
-          <button
-            class="del"
-            title="Delete"
-            onpointerdown={(e) => e.stopPropagation()}
-            onclick={() => deleteNode(node.id)}
-          >×</button>
-        </div>
+              <button
+                class="del"
+                title="Delete"
+                onpointerdown={(e) => e.stopPropagation()}
+                onclick={() => deleteNode(node.id)}
+              >×</button>
+            </div>
 
-        <div class="meta">
-          <span class="badge" class:complete>
-            {prog.done}/{prog.total}
-          </span>
-          <!-- Connection handle: drag me onto another node -->
-          <button
-            class="handle"
-            title="Drag onto another card to set its parent"
-            onpointerdown={(e) => startLink(e, node)}
-          >◦ connect</button>
-        </div>
+            <div class="meta">
+              <span class="badge" class:complete>{prog.done}/{prog.total}</span>
+              <button
+                class="handle"
+                title="Drag onto another card to set its parent"
+                onpointerdown={(e) => startLink(e, node)}
+              >◦ connect</button>
+            </div>
 
-        <!-- Resize grip -->
-        <div
-          class="grip"
-          title="Drag to resize"
-          onpointerdown={(e) => startResize(e, node)}
-        ></div>
-      </div>
-    {/each}
+            <div class="grip" title="Drag to resize" onpointerdown={(e) => startResize(e, node)}></div>
+          </div>
+        {/if}
+      {/each}
+    </div>
 
     {#if nodes.length === 0}
       <div class="empty">No nodes yet — hit <b>+ Add node</b> to start your tree.</div>
@@ -515,6 +610,21 @@
   }
   .spacer {
     flex: 1;
+  }
+  .zoom {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .zoom button {
+    padding: 4px 9px;
+  }
+  .zval {
+    font-variant-numeric: tabular-nums;
+    color: #9aa0c0;
+    font-size: 12px;
+    min-width: 38px;
+    text-align: center;
   }
   .count {
     font-variant-numeric: tabular-nums;
@@ -557,10 +667,20 @@
   .canvas {
     position: relative;
     flex: 1;
-    overflow: auto;
+    overflow: hidden;
     background:
       radial-gradient(circle at 1px 1px, #23273f 1px, transparent 0) 0 0 / 26px 26px;
     touch-action: none;
+    cursor: grab;
+  }
+  .canvas:active {
+    cursor: grabbing;
+  }
+
+  .world {
+    position: absolute;
+    inset: 0;
+    transform-origin: 0 0;
   }
 
   .edges {
@@ -584,23 +704,29 @@
     stroke-dasharray: 6 5;
   }
 
-  .node {
+  .node,
+  .note {
     position: absolute;
-    background: #1b1f36;
-    border: 1px solid #313657;
+    box-sizing: border-box;
     border-radius: 12px;
-    padding: 10px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
     cursor: grab;
     user-select: none;
-    box-sizing: border-box;
     display: flex;
     flex-direction: column;
   }
-  .node:active {
+  .node:active,
+  .note:active {
     cursor: grabbing;
   }
-  .node.selected {
+
+  .node {
+    background: #1b1f36;
+    border: 1px solid #313657;
+    padding: 10px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  }
+  .node.selected,
+  .note.selected {
     border-color: #4f6bff;
     box-shadow: 0 0 0 2px rgba(79, 107, 255, 0.35), 0 6px 18px rgba(0, 0, 0, 0.4);
   }
@@ -611,6 +737,22 @@
   /* Completed or blocked (inaccessible) tasks read as dimmer. */
   .node.dim {
     filter: brightness(0.72);
+  }
+
+  /* Text box: just the text, an outline, and an x. */
+  .note {
+    background: rgba(20, 23, 42, 0.6);
+    border: 1px dashed #3a4066;
+    padding: 6px 22px 6px 8px;
+    box-shadow: none;
+  }
+  .note .text {
+    font-size: 13px;
+  }
+  .note-del {
+    position: absolute;
+    top: 2px;
+    right: 2px;
   }
 
   .row {
@@ -644,6 +786,7 @@
   .text {
     flex: 1;
     min-width: 0;
+    width: 100%;
     background: transparent;
     border: none;
     color: inherit;
@@ -656,7 +799,6 @@
   }
   .text:focus {
     outline: none;
-    border-bottom: 1px solid #4f6bff;
   }
   .node.done .text {
     text-decoration: line-through;

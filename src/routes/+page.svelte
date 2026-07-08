@@ -1,14 +1,20 @@
 <script>
   import { onMount } from 'svelte';
+  import { supabase, TREE_ID } from '$lib/supabase.js';
 
   // ---- Model -------------------------------------------------------------
-  // A node is a todo: { id, text, done, x, y, parent }
+  // A node is a todo: { id, text, done, x, y, parent, w?, h? }
   // The tree is defined by each node's `parent` (null = root). One parent,
-  // many children. Cycles are prevented when re-parenting.
+  // many children. Children are prerequisites: a node can only be completed
+  // once all of its children (the tasks that "lead to" it) are done.
+  // `w`/`h` are optional manual sizes set by dragging the resize grip.
 
   let nodes = $state([]);
   let nextId = $state(1);
   let selectedId = $state(null);
+
+  // Measured on-screen size of each node card (id -> {w,h}); used to anchor edges.
+  let dims = $state({});
 
   // Connection drag state: when the user grabs a node's handle we track the
   // pointer so we can draw a live "rubber band" and drop onto a target.
@@ -16,9 +22,16 @@
   let hoverTargetId = $state(null);
 
   const STORAGE_KEY = 'tree-todo-v1';
+  const DEFAULT_W = 200;
+  const DEFAULT_H = 84;
 
-  // ---- Persistence -------------------------------------------------------
+  // ---- Persistence + Supabase sync --------------------------------------
+  let loaded = false;
+  let lastSynced = '';
+  let saveTimer;
+
   onMount(() => {
+    // Load the local cache first so the tree shows instantly / works offline.
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -29,25 +42,80 @@
     } catch (e) {
       console.warn('Could not load saved tree', e);
     }
-    if (nodes.length === 0) seed();
+    init();
+    return () => clearTimeout(saveTimer);
   });
+
+  async function init() {
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('trees')
+        .select('data')
+        .eq('id', TREE_ID)
+        .maybeSingle();
+
+      if (!error && data?.data?.nodes) {
+        nodes = data.data.nodes;
+        nextId = data.data.nextId ?? nodes.length + 1;
+        lastSynced = JSON.stringify({ nodes, nextId });
+      } else if (nodes.length === 0) {
+        seed();
+      }
+
+      // Live updates from other devices editing the same tree.
+      supabase
+        .channel('trees-sync')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'trees', filter: `id=eq.${TREE_ID}` },
+          (payload) => {
+            const d = payload.new?.data;
+            if (!d?.nodes) return;
+            const incoming = JSON.stringify({ nodes: d.nodes, nextId: d.nextId ?? nextId });
+            if (incoming === lastSynced) return; // our own echo
+            // Don't yank the tree out from under an in-progress drag/resize.
+            if (dragging || resizing || linking) return;
+            lastSynced = incoming;
+            nodes = d.nodes;
+            nextId = d.nextId ?? nextId;
+          }
+        )
+        .subscribe();
+    } else if (nodes.length === 0) {
+      seed();
+    }
+    loaded = true;
+  }
 
   $effect(() => {
     // Re-runs whenever nodes/nextId change.
-    const data = JSON.stringify({ nodes, nextId });
+    const payload = JSON.stringify({ nodes, nextId });
     try {
-      localStorage.setItem(STORAGE_KEY, data);
+      localStorage.setItem(STORAGE_KEY, payload);
     } catch (e) {
       /* ignore quota errors */
     }
+    if (!loaded || payload === lastSynced) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveRemote(payload), 400);
   });
+
+  async function saveRemote(payload) {
+    if (!supabase) return;
+    lastSynced = payload;
+    const body = JSON.parse(payload);
+    const { error } = await supabase
+      .from('trees')
+      .upsert({ id: TREE_ID, data: body, updated_at: new Date().toISOString() });
+    if (error) console.warn('Supabase save failed', error);
+  }
 
   function seed() {
     nodes = [
       { id: 1, text: 'Plan the project', done: false, x: 420, y: 80, parent: null },
-      { id: 2, text: 'Design the UI', done: false, x: 220, y: 260, parent: 1 },
-      { id: 3, text: 'Build the backend', done: false, x: 620, y: 260, parent: 1 },
-      { id: 4, text: 'Pick colors', done: true, x: 120, y: 440, parent: 2 }
+      { id: 2, text: 'Design the UI', done: false, x: 220, y: 300, parent: 1 },
+      { id: 3, text: 'Build the backend', done: false, x: 620, y: 300, parent: 1 },
+      { id: 4, text: 'Pick colors', done: true, x: 120, y: 520, parent: 2 }
     ];
     nextId = 5;
   }
@@ -61,8 +129,8 @@
       const p = nodes.find((n) => n.id === parent);
       if (p) {
         const siblings = nodes.filter((n) => n.parent === parent).length;
-        x = p.x + siblings * 180 - 60;
-        y = p.y + 160;
+        x = p.x + siblings * 200 - 60;
+        y = p.y + 180;
       }
     }
     const node = { id: nextId, text: 'New todo', done: false, x, y, parent };
@@ -86,8 +154,37 @@
     if (selectedId === id) selectedId = null;
   }
 
+  // Children are the prerequisites of a node.
+  function prereqs(id) {
+    return nodes.filter((n) => n.parent === id);
+  }
+  // Can this node be marked done? Only once every prerequisite is done.
+  function canComplete(id) {
+    return prereqs(id).every((d) => d.done);
+  }
+  // "Inaccessible": not done yet and still waiting on unfinished prerequisites.
+  function isBlocked(id) {
+    const n = nodeById.get(id);
+    return n ? !n.done && !canComplete(id) : false;
+  }
+
   function toggleDone(id) {
-    nodes = nodes.map((n) => (n.id === id ? { ...n, done: !n.done } : n));
+    const node = nodeById.get(id);
+    if (!node) return;
+    if (!node.done) {
+      // Locked until every prerequisite (child) is complete.
+      if (!canComplete(id)) return;
+      nodes = nodes.map((n) => (n.id === id ? { ...n, done: true } : n));
+    } else {
+      // Un-completing breaks the chain, so no ancestor may stay "done".
+      const undo = new Set([id]);
+      let cur = node.parent;
+      while (cur != null) {
+        undo.add(cur);
+        cur = nodeById.get(cur)?.parent ?? null;
+      }
+      nodes = nodes.map((n) => (undo.has(n.id) ? { ...n, done: false } : n));
+    }
   }
 
   function setText(id, text) {
@@ -123,11 +220,12 @@
 
   // ---- Dragging nodes ----------------------------------------------------
   let dragging = null; // { id, dx, dy }
+  let resizing = null; // { id, sx, sy, w, h }
   let canvasEl;
 
   function pointerInCanvas(e) {
     const r = canvasEl.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
+    return { x: e.clientX - r.left + canvasEl.scrollLeft, y: e.clientY - r.top + canvasEl.scrollTop };
   }
 
   function startDrag(e, node) {
@@ -147,9 +245,23 @@
     window.addEventListener('pointerup', onPointerUp);
   }
 
+  function startResize(e, node) {
+    e.stopPropagation();
+    if (e.button !== 0) return;
+    const p = pointerInCanvas(e);
+    const d = dims[node.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
+    resizing = { id: node.id, sx: p.x, sy: p.y, w: node.w ?? d.w, h: node.h ?? d.h };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+  }
+
   function onPointerMove(e) {
     const p = pointerInCanvas(e);
-    if (dragging) {
+    if (resizing) {
+      const w = Math.max(150, Math.round(resizing.w + (p.x - resizing.sx)));
+      const h = Math.max(64, Math.round(resizing.h + (p.y - resizing.sy)));
+      nodes = nodes.map((n) => (n.id === resizing.id ? { ...n, w, h } : n));
+    } else if (dragging) {
       nodes = nodes.map((n) =>
         n.id === dragging.id ? { ...n, x: p.x - dragging.dx, y: p.y - dragging.dy } : n
       );
@@ -168,10 +280,42 @@
       connect(linking.fromId, hoverTargetId);
     }
     dragging = null;
+    resizing = null;
     linking = null;
     hoverTargetId = null;
     window.removeEventListener('pointermove', onPointerMove);
     window.removeEventListener('pointerup', onPointerUp);
+  }
+
+  // ---- Actions -----------------------------------------------------------
+  // Grow a textarea to fit all of its text (no scrollbar, no clipping).
+  function autogrow(el) {
+    const resize = () => {
+      el.style.height = '0px';
+      el.style.height = el.scrollHeight + 'px';
+    };
+    const raf = () => requestAnimationFrame(resize);
+    raf();
+    el.addEventListener('input', raf);
+    return {
+      update() {
+        raf();
+      },
+      destroy() {
+        el.removeEventListener('input', raf);
+      }
+    };
+  }
+
+  // Track a card's rendered size so edges anchor to its real edges.
+  function measure(el, id) {
+    const update = () => {
+      dims = { ...dims, [id]: { w: el.offsetWidth, h: el.offsetHeight } };
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return { destroy: () => ro.disconnect() };
   }
 
   // ---- Derived: edges + progress ----------------------------------------
@@ -201,12 +345,14 @@
     return { total, done };
   }
 
-  // Anchor points for an edge (bottom of parent -> top of child).
-  const NODE_W = 176;
+  // Anchor points for an edge: bottom-center of parent -> top-center of child,
+  // using the measured card sizes.
   function edgePath(from, to) {
-    const x1 = from.x + NODE_W / 2;
-    const y1 = from.y + 74;
-    const x2 = to.x + NODE_W / 2;
+    const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
+    const td = dims[to.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
+    const x1 = from.x + fd.w / 2;
+    const y1 = from.y + fd.h;
+    const x2 = to.x + td.w / 2;
     const y2 = to.y;
     const my = (y1 + y2) / 2;
     return `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
@@ -229,8 +375,9 @@
       <button class="ghost" onclick={clearAll}>Clear</button>
     </div>
     <p class="hint">
-      Drag a card to move it. Drag from a card's <b>◦ handle</b> onto another card to make that
-      card its <b>parent</b>. Click a card to select it.
+      Drag a card to move it, or its <b>bottom-right grip</b> to resize. Drag from a card's
+      <b>◦ handle</b> onto another card to make that card its <b>parent</b>. A card's children are
+      its prerequisites — finish them before you can check it off.
     </p>
   </header>
 
@@ -251,9 +398,10 @@
       {#if linking}
         {@const from = nodeById.get(linking.fromId)}
         {#if from}
+          {@const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H }}
           <path
             class="linking"
-            d={`M ${from.x + NODE_W / 2} ${from.y + 37} L ${linking.x} ${linking.y}`}
+            d={`M ${from.x + fd.w / 2} ${from.y + fd.h / 2} L ${linking.x} ${linking.y}`}
             fill="none"
           />
         {/if}
@@ -264,13 +412,16 @@
     {#each nodes as node (node.id)}
       {@const prog = subtreeProgress(node.id)}
       {@const complete = prog.done === prog.total}
+      {@const blocked = isBlocked(node.id)}
       <div
         class="node"
         class:done={node.done}
+        class:dim={node.done || blocked}
         class:selected={selectedId === node.id}
         class:target={hoverTargetId === node.id}
         data-node-id={node.id}
-        style="left:{node.x}px; top:{node.y}px"
+        use:measure={node.id}
+        style="left:{node.x}px; top:{node.y}px; width:{node.w ?? DEFAULT_W}px; min-height:{node.h ?? DEFAULT_H}px"
         onpointerdown={(e) => {
           e.stopPropagation();
           startDrag(e, node);
@@ -280,17 +431,21 @@
           <button
             class="check"
             class:on={node.done}
-            title="Toggle done"
+            class:locked={blocked}
+            disabled={blocked}
+            title={blocked ? 'Complete its prerequisite tasks first' : 'Toggle done'}
             onpointerdown={(e) => e.stopPropagation()}
             onclick={() => toggleDone(node.id)}
-          >{node.done ? '✓' : ''}</button>
+          >{node.done ? '✓' : blocked ? '🔒' : ''}</button>
 
-          <input
+          <textarea
             class="text"
+            rows="1"
             value={node.text}
+            use:autogrow={[node.text, node.w]}
             onpointerdown={(e) => e.stopPropagation()}
             oninput={(e) => setText(node.id, e.currentTarget.value)}
-          />
+          ></textarea>
 
           <button
             class="del"
@@ -311,6 +466,13 @@
             onpointerdown={(e) => startLink(e, node)}
           >◦ connect</button>
         </div>
+
+        <!-- Resize grip -->
+        <div
+          class="grip"
+          title="Drag to resize"
+          onpointerdown={(e) => startResize(e, node)}
+        ></div>
       </div>
     {/each}
 
@@ -424,7 +586,6 @@
 
   .node {
     position: absolute;
-    width: 176px;
     background: #1b1f36;
     border: 1px solid #313657;
     border-radius: 12px;
@@ -432,6 +593,9 @@
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
     cursor: grab;
     user-select: none;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
   }
   .node:active {
     cursor: grabbing;
@@ -444,13 +608,14 @@
     border-color: #57d98a;
     box-shadow: 0 0 0 3px rgba(87, 217, 138, 0.4);
   }
-  .node.done {
-    opacity: 0.7;
+  /* Completed or blocked (inaccessible) tasks read as dimmer. */
+  .node.dim {
+    filter: brightness(0.72);
   }
 
   .row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 6px;
   }
   .check {
@@ -461,10 +626,20 @@
     color: #fff;
     font-size: 13px;
     flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .check.on {
     background: #2f8f5b;
     border-color: #2f8f5b;
+  }
+  .check.locked {
+    cursor: not-allowed;
+    font-size: 11px;
+  }
+  .check:disabled {
+    opacity: 0.9;
   }
   .text {
     flex: 1;
@@ -475,6 +650,9 @@
     font: inherit;
     font-size: 14px;
     padding: 2px 0;
+    resize: none;
+    overflow: hidden;
+    line-height: 1.35;
   }
   .text:focus {
     outline: none;
@@ -528,6 +706,23 @@
   .handle:hover {
     border-color: #4f6bff;
     color: #fff;
+  }
+
+  .grip {
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    width: 14px;
+    height: 14px;
+    cursor: nwse-resize;
+    border-right: 2px solid #4b5382;
+    border-bottom: 2px solid #4b5382;
+    border-bottom-right-radius: 10px;
+    opacity: 0.6;
+  }
+  .grip:hover {
+    opacity: 1;
+    border-color: #4f6bff;
   }
 
   .empty {

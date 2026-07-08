@@ -4,10 +4,12 @@
 
   // ---- Model -------------------------------------------------------------
   // Items live in one array. Two kinds:
-  //   task: { id, kind:'task', text, done, x, y, parent, w?, h? }
+  //   task: { id, kind:'task', text, done, x, y, deps:number[], w?, h? }
   //   note: { id, kind:'note', text, x, y, w?, h? }   (free-floating text box)
-  // The task tree is defined by each task's `parent` (null = root). Children
-  // are prerequisites: a task can only be completed once all its children are.
+  // Dependencies form a DAG: `deps` lists the tasks that must be done BEFORE
+  // this one (its prerequisites). A prerequisite can feed many dependents —
+  // e.g. "get milk" can be a dep of both "ice cream" and "mac & cheese".
+  // A task is completable only once every task in its `deps` is done.
   // `w`/`h` are optional manual sizes set by dragging the resize grip.
 
   let nodes = $state([]);
@@ -32,6 +34,22 @@
   const isNote = (n) => n.kind === 'note';
   const isTask = (n) => n.kind !== 'note';
 
+  // Normalize loaded data: ensure every task has a `deps` array and migrate
+  // the old single-`parent` shape (child.parent = P  =>  P depends on child).
+  function migrate(list) {
+    if (!Array.isArray(list)) return [];
+    const byId = new Map(list.map((n) => [n.id, n]));
+    for (const n of list) if (!Array.isArray(n.deps)) n.deps = [];
+    for (const n of list) {
+      if (n.parent != null && byId.has(n.parent)) {
+        const p = byId.get(n.parent);
+        if (!p.deps.includes(n.id)) p.deps.push(n.id);
+      }
+      delete n.parent;
+    }
+    return list;
+  }
+
   // ---- Persistence + Supabase sync --------------------------------------
   let loaded = false;
   let lastSynced = '';
@@ -43,7 +61,7 @@
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const data = JSON.parse(saved);
-        nodes = data.nodes ?? [];
+        nodes = migrate(data.nodes ?? []);
         nextId = data.nextId ?? nodes.length + 1;
         if (data.view) view = data.view;
       }
@@ -67,7 +85,7 @@
         .maybeSingle();
 
       if (!error && data?.data?.nodes) {
-        nodes = data.data.nodes;
+        nodes = migrate(data.data.nodes);
         nextId = data.data.nextId ?? nodes.length + 1;
         lastSynced = JSON.stringify({ nodes, nextId });
       } else if (nodes.length === 0) {
@@ -88,7 +106,7 @@
             // Don't yank the tree out from under an in-progress interaction.
             if (dragging || resizing || linking || panning) return;
             lastSynced = incoming;
-            nodes = d.nodes;
+            nodes = migrate(d.nodes);
             nextId = d.nextId ?? nextId;
           }
         )
@@ -124,11 +142,12 @@
   }
 
   function seed() {
+    // Demo of a shared prerequisite: "Get milk" unlocks two dishes.
     nodes = [
-      { id: 1, kind: 'task', text: 'Plan the project', done: false, x: 420, y: 80, parent: null },
-      { id: 2, kind: 'task', text: 'Design the UI', done: false, x: 220, y: 300, parent: 1 },
-      { id: 3, kind: 'task', text: 'Build the backend', done: false, x: 620, y: 300, parent: 1 },
-      { id: 4, kind: 'task', text: 'Pick colors', done: true, x: 120, y: 520, parent: 2 }
+      { id: 1, kind: 'task', text: 'Get milk', done: false, x: 360, y: 80, deps: [] },
+      { id: 2, kind: 'task', text: 'Make ice cream', done: false, x: 160, y: 300, deps: [1] },
+      { id: 3, kind: 'task', text: 'Make mac & cheese', done: false, x: 560, y: 300, deps: [1] },
+      { id: 4, kind: 'task', text: 'Serve dinner', done: false, x: 360, y: 520, deps: [2, 3] }
     ];
     nextId = 5;
   }
@@ -137,18 +156,23 @@
   function addNode(parent = null) {
     let x, y;
     if (parent != null) {
-      const p = nodes.find((n) => n.id === parent);
-      const siblings = nodes.filter((n) => n.parent === parent).length;
-      x = p.x + siblings * 200 - 60;
-      y = p.y + 180;
+      const p = nodeById.get(parent);
+      const count = p?.deps?.length ?? 0;
+      x = (p?.x ?? 0) + count * 200 - 60;
+      y = (p?.y ?? 0) - 180; // a prerequisite sits above the task it unlocks
     } else {
       const c = viewCenterWorld();
       x = c.x - DEFAULT_W / 2;
       y = c.y - DEFAULT_H / 2;
     }
-    const node = { id: nextId, kind: 'task', text: 'New todo', done: false, x, y, parent };
-    nodes = [...nodes, node];
-    selectedId = nextId;
+    const id = nextId;
+    let next = [...nodes, { id, kind: 'task', text: 'New todo', done: false, x, y, deps: [] }];
+    if (parent != null) {
+      // The new task becomes a prerequisite of the selected task.
+      next = next.map((n) => (n.id === parent ? { ...n, deps: [...(n.deps ?? []), id] } : n));
+    }
+    nodes = next;
+    selectedId = id;
     nextId += 1;
   }
 
@@ -161,18 +185,15 @@
   }
 
   function deleteNode(id) {
-    // Re-parent children up to the deleted node's parent so the tree stays connected.
-    const target = nodes.find((n) => n.id === id);
-    if (!target) return;
     nodes = nodes
       .filter((n) => n.id !== id)
-      .map((n) => (n.parent === id ? { ...n, parent: target.parent } : n));
+      .map((n) => ((n.deps ?? []).includes(id) ? { ...n, deps: n.deps.filter((d) => d !== id) } : n));
     if (selectedId === id) selectedId = null;
   }
 
-  // Children are the prerequisites of a task.
+  // Direct prerequisites of a task.
   function prereqs(id) {
-    return nodes.filter((n) => n.parent === id);
+    return (nodeById.get(id)?.deps ?? []).map((d) => nodeById.get(d)).filter(Boolean);
   }
   function canComplete(id) {
     return prereqs(id).every((d) => d.done);
@@ -183,6 +204,11 @@
     return n ? !n.done && !canComplete(id) : false;
   }
 
+  // Tasks that list `id` among their prerequisites.
+  function dependentsOf(id) {
+    return nodes.filter((n) => (n.deps ?? []).includes(id));
+  }
+
   function toggleDone(id) {
     const node = nodeById.get(id);
     if (!node) return;
@@ -190,12 +216,14 @@
       if (!canComplete(id)) return; // locked until every prerequisite is done
       nodes = nodes.map((n) => (n.id === id ? { ...n, done: true } : n));
     } else {
-      // Un-completing breaks the chain, so no ancestor may stay "done".
-      const undo = new Set([id]);
-      let cur = node.parent;
-      while (cur != null) {
+      // Un-completing breaks the chain, so anything depending on it can't stay done.
+      const undo = new Set();
+      const stack = [id];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (undo.has(cur)) continue;
         undo.add(cur);
-        cur = nodeById.get(cur)?.parent ?? null;
+        for (const dep of dependentsOf(cur)) stack.push(dep.id);
       }
       nodes = nodes.map((n) => (undo.has(n.id) ? { ...n, done: false } : n));
     }
@@ -205,24 +233,40 @@
     nodes = nodes.map((n) => (n.id === id ? { ...n, text } : n));
   }
 
-  function wouldCycle(childId, parentId) {
-    let cur = parentId;
-    while (cur != null) {
-      if (cur === childId) return true;
-      cur = nodes.find((n) => n.id === cur)?.parent ?? null;
+  // Can `start` reach `target` by following prerequisite links?
+  function reachable(start, target) {
+    const seen = new Set();
+    const stack = [start];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (cur === target) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const d of nodeById.get(cur)?.deps ?? []) stack.push(d);
     }
     return false;
   }
 
-  function connect(childId, parentId) {
-    if (childId === parentId) return;
-    if (nodeById.get(parentId)?.kind === 'note') return; // notes can't be parents
-    if (wouldCycle(parentId, childId)) return; // dropping a parent onto its own descendant
-    nodes = nodes.map((n) => (n.id === childId ? { ...n, parent: parentId } : n));
+  // Make `prereqId` a prerequisite of `dependentId`.
+  function connect(prereqId, dependentId) {
+    if (prereqId === dependentId) return;
+    const dep = nodeById.get(dependentId);
+    const pre = nodeById.get(prereqId);
+    if (!dep || !pre || isNote(dep) || isNote(pre)) return; // notes never link
+    if ((dep.deps ?? []).includes(prereqId)) return; // already connected
+    if (reachable(prereqId, dependentId)) return; // would create a cycle
+    nodes = nodes.map((n) =>
+      n.id === dependentId ? { ...n, deps: [...(n.deps ?? []), prereqId] } : n
+    );
   }
 
+  // Fully disconnect a node (drop its prereqs and remove it from others').
   function detach(id) {
-    nodes = nodes.map((n) => (n.id === id ? { ...n, parent: null } : n));
+    nodes = nodes.map((n) => {
+      if (n.id === id) return { ...n, deps: [] };
+      if ((n.deps ?? []).includes(id)) return { ...n, deps: n.deps.filter((d) => d !== id) };
+      return n;
+    });
   }
 
   function clearAll() {
@@ -314,6 +358,7 @@
 
   function onPointerUp() {
     if (linking && hoverTargetId != null) {
+      // Dropped the dragged card onto a target => this card is its prerequisite.
       connect(linking.fromId, hoverTargetId);
     }
     dragging = null;
@@ -386,10 +431,15 @@
   // ---- Derived: edges + progress ----------------------------------------
   const nodeById = $derived(new Map(nodes.map((n) => [n.id, n])));
 
+  // One edge per (prerequisite -> dependent) link. `from` = prerequisite.
   const edges = $derived(
-    nodes
-      .filter((n) => isTask(n) && n.parent != null && nodeById.has(n.parent))
-      .map((n) => ({ from: nodeById.get(n.parent), to: n }))
+    nodes.flatMap((n) =>
+      isTask(n)
+        ? (n.deps ?? [])
+            .filter((d) => nodeById.has(d))
+            .map((d) => ({ from: nodeById.get(d), to: n }))
+        : []
+    )
   );
 
   const stats = $derived({
@@ -397,20 +447,28 @@
     done: nodes.filter((n) => isTask(n) && n.done).length
   });
 
-  // A subtree counts as "complete" for the ring if the node + all descendants done.
+  // Progress over a task and all of its (unique) transitive prerequisites.
   function subtreeProgress(id) {
-    const kids = nodes.filter((n) => n.parent === id);
-    let total = 1;
-    let done = nodeById.get(id)?.done ? 1 : 0;
-    for (const k of kids) {
-      const sub = subtreeProgress(k.id);
-      total += sub.total;
-      done += sub.done;
+    const seen = new Set();
+    const stack = [id];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const d of nodeById.get(cur)?.deps ?? []) stack.push(d);
+    }
+    let total = 0;
+    let done = 0;
+    for (const nid of seen) {
+      const n = nodeById.get(nid);
+      if (!n) continue;
+      total += 1;
+      if (n.done) done += 1;
     }
     return { total, done };
   }
 
-  // Anchor points for an edge: bottom-center of parent -> top-center of child.
+  // Anchor points for an edge: bottom-center of prerequisite -> top-center of dependent.
   function edgePath(from, to) {
     const fd = dims[from.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
     const td = dims[to.id] ?? { w: DEFAULT_W, h: DEFAULT_H };
@@ -432,7 +490,7 @@
       <button class="primary" onclick={() => addNode(null)}>+ Add node</button>
       <button onclick={addNote}>+ Text box</button>
       {#if selectedId != null}
-        <button onclick={() => addNode(selectedId)}>+ Child of selected</button>
+        <button onclick={() => addNode(selectedId)}>+ Prerequisite of selected</button>
         <button onclick={() => detach(selectedId)}>Detach selected</button>
       {/if}
       <span class="spacer"></span>
@@ -447,8 +505,9 @@
     </div>
     <p class="hint">
       Drag empty space to <b>pan</b>, scroll to <b>zoom</b>. Drag a card to move it, or its
-      <b>bottom-right grip</b> to resize. Drag a card's <b>◦ handle</b> onto another to make that
-      card its <b>parent</b> — children are prerequisites you must finish first.
+      <b>bottom-right grip</b> to resize. Drag a card's <b>◦ handle</b> onto another to make this
+      card a <b>prerequisite</b> of it — one card can unlock many, and a card only unlocks once
+      every prerequisite is done.
     </p>
   </header>
 
@@ -464,8 +523,8 @@
     >
       <!-- Edges -->
       <svg class="edges">
-        {#each edges as e (e.to.id)}
-          <path d={edgePath(e.from, e.to)} class:done={e.to.done} fill="none" />
+        {#each edges as e (`${e.from.id}-${e.to.id}`)}
+          <path d={edgePath(e.from, e.to)} class:done={e.from.done} fill="none" />
         {/each}
         {#if linking}
           {@const from = nodeById.get(linking.fromId)}
@@ -560,7 +619,7 @@
               <span class="badge" class:complete>{prog.done}/{prog.total}</span>
               <button
                 class="handle"
-                title="Drag onto another card to set its parent"
+                title="Drag onto another card to make this its prerequisite"
                 onpointerdown={(e) => startLink(e, node)}
               >◦ connect</button>
             </div>
